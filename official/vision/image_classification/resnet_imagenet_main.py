@@ -1,4 +1,4 @@
-# Copyright 2018 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2019 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,42 +12,98 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Runs a ResNet model on the ImageNet dataset."""
+"""Runs a ResNet model on the ImageNet dataset using custom training loops."""
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
-
-import os
 
 from absl import app
 from absl import flags
 from absl import logging
 import tensorflow as tf
 
-import tensorflow_model_optimization as tfmot
-
-from official.benchmark.models import trivial_model
 from official.modeling import performance
+from official.staging.training import controller
 from official.utils.flags import core as flags_core
 from official.utils.logs import logger
 from official.utils.misc import distribution_utils
 from official.utils.misc import keras_utils
 from official.utils.misc import model_helpers
-from official.vision.image_classification import common
-from official.vision.image_classification import imagenet_preprocessing
-from official.vision.image_classification.resnet import resnet_model
+from official.vision.image_classification.resnet import common
+from official.vision.image_classification.resnet import imagenet_preprocessing
+from official.vision.image_classification.resnet import resnet_runnable
+
+flags.DEFINE_boolean(name='use_tf_function', default=True,
+                     help='Wrap the train and test step inside a '
+                     'tf.function.')
+flags.DEFINE_boolean(name='single_l2_loss_op', default=False,
+                     help='Calculate L2_loss on concatenated weights, '
+                     'instead of using Keras per-layer L2 loss.')
+
+
+def build_stats(runnable, time_callback):
+  """Normalizes and returns dictionary of stats.
+
+  Args:
+    runnable: The module containing all the training and evaluation metrics.
+    time_callback: Time tracking callback instance.
+
+  Returns:
+    Dictionary of normalized results.
+  """
+  stats = {}
+
+  if not runnable.flags_obj.skip_eval:
+    stats['eval_loss'] = runnable.test_loss.result().numpy()
+    stats['eval_acc'] = runnable.test_accuracy.result().numpy()
+
+    stats['train_loss'] = runnable.train_loss.result().numpy()
+    stats['train_acc'] = runnable.train_accuracy.result().numpy()
+
+  if time_callback:
+    timestamp_log = time_callback.timestamp_log
+    stats['step_timestamp_log'] = timestamp_log
+    stats['train_finish_time'] = time_callback.train_finish_time
+    if time_callback.epoch_runtime_log:
+      stats['avg_exp_per_second'] = time_callback.average_examples_per_second
+
+  return stats
+
+
+def get_num_train_iterations(flags_obj):
+  """Returns the number of training steps, train and test epochs."""
+  train_steps = (
+      imagenet_preprocessing.NUM_IMAGES['train'] // flags_obj.batch_size)
+  train_epochs = flags_obj.train_epochs
+
+  if flags_obj.train_steps:
+    train_steps = min(flags_obj.train_steps, train_steps)
+    train_epochs = 1
+
+  eval_steps = (
+      imagenet_preprocessing.NUM_IMAGES['validation'] // flags_obj.batch_size)
+
+  return train_steps, train_epochs, eval_steps
+
+
+def _steps_to_run(steps_in_current_epoch, steps_per_epoch, steps_per_loop):
+  """Calculates steps to run on device."""
+  if steps_per_loop <= 0:
+    raise ValueError('steps_per_loop should be positive integer.')
+  if steps_per_loop == 1:
+    return steps_per_loop
+  return min(steps_per_loop, steps_per_epoch - steps_in_current_epoch)
 
 
 def run(flags_obj):
-  """Run ResNet ImageNet training and eval loop using native Keras APIs.
+  """Run ResNet ImageNet training and eval loop using custom training loops.
 
   Args:
     flags_obj: An object containing parsed flag values.
 
   Raises:
     ValueError: If fp16 is passed as it is not currently supported.
-    NotImplementedError: If some features are not currently supported.
 
   Returns:
     Dictionary of training and eval stats.
@@ -55,30 +111,17 @@ def run(flags_obj):
   keras_utils.set_session_config(
       enable_eager=flags_obj.enable_eager,
       enable_xla=flags_obj.enable_xla)
+  performance.set_mixed_precision_policy(flags_core.get_tf_dtype(flags_obj))
 
-  # Execute flag override logic for better model performance
-  if flags_obj.tf_gpu_thread_mode:
-    keras_utils.set_gpu_thread_mode_and_count(
-        per_gpu_thread_count=flags_obj.per_gpu_thread_count,
-        gpu_thread_mode=flags_obj.tf_gpu_thread_mode,
-        num_gpus=flags_obj.num_gpus,
-        datasets_num_private_threads=flags_obj.datasets_num_private_threads)
+  # This only affects GPU.
   common.set_cudnn_batchnorm_mode()
 
-  dtype = flags_core.get_tf_dtype(flags_obj)
-  performance.set_mixed_precision_policy(
-      flags_core.get_tf_dtype(flags_obj),
-      flags_core.get_loss_scale(flags_obj, default_for_fp16=128))
-
+  # TODO(anj-s): Set data_format without using Keras.
   data_format = flags_obj.data_format
   if data_format is None:
     data_format = ('channels_first'
                    if tf.test.is_built_with_cuda() else 'channels_last')
   tf.keras.backend.set_image_data_format(data_format)
-
-  # Configures cluster spec for distribution strategy.
-  _ = distribution_utils.configure_cluster(flags_obj.worker_hosts,
-                                           flags_obj.task_index)
 
   strategy = distribution_utils.get_distribution_strategy(
       distribution_strategy=flags_obj.distribution_strategy,
@@ -87,214 +130,53 @@ def run(flags_obj):
       num_packs=flags_obj.num_packs,
       tpu_address=flags_obj.tpu)
 
-  if strategy:
-    # flags_obj.enable_get_next_as_optional controls whether enabling
-    # get_next_as_optional behavior in DistributedIterator. If true, last
-    # partial batch can be supported.
-    strategy.extended.experimental_enable_get_next_as_optional = (
-        flags_obj.enable_get_next_as_optional
-    )
+  per_epoch_steps, train_epochs, eval_steps = get_num_train_iterations(
+      flags_obj)
+  steps_per_loop = min(flags_obj.steps_per_loop, per_epoch_steps)
 
-  strategy_scope = distribution_utils.get_strategy_scope(strategy)
+  logging.info(
+      'Training %d epochs, each epoch has %d steps, '
+      'total steps: %d; Eval %d steps', train_epochs, per_epoch_steps,
+      train_epochs * per_epoch_steps, eval_steps)
 
-  # pylint: disable=protected-access
-  if flags_obj.use_synthetic_data:
-    distribution_utils.set_up_synthetic_data()
-    input_fn = common.get_synth_input_fn(
-        height=imagenet_preprocessing.DEFAULT_IMAGE_SIZE,
-        width=imagenet_preprocessing.DEFAULT_IMAGE_SIZE,
-        num_channels=imagenet_preprocessing.NUM_CHANNELS,
-        num_classes=imagenet_preprocessing.NUM_CLASSES,
-        dtype=dtype,
-        drop_remainder=True)
-  else:
-    distribution_utils.undo_set_up_synthetic_data()
-    input_fn = imagenet_preprocessing.input_fn
+  time_callback = keras_utils.TimeHistory(
+      flags_obj.batch_size,
+      flags_obj.log_steps,
+      logdir=flags_obj.model_dir if flags_obj.enable_tensorboard else None)
+  with distribution_utils.get_strategy_scope(strategy):
+    runnable = resnet_runnable.ResnetRunnable(flags_obj, time_callback,
+                                              per_epoch_steps)
 
-  # When `enable_xla` is True, we always drop the remainder of the batches
-  # in the dataset, as XLA-GPU doesn't support dynamic shapes.
-  drop_remainder = flags_obj.enable_xla
+  eval_interval = flags_obj.epochs_between_evals * per_epoch_steps
+  checkpoint_interval = (
+      per_epoch_steps if flags_obj.enable_checkpoint_and_export else None)
+  summary_interval = per_epoch_steps if flags_obj.enable_tensorboard else None
 
-  # Current resnet_model.resnet50 input format is always channel-last.
-  # We use keras_application mobilenet model which input format is depends on
-  # the keras beckend image data format.
-  # This use_keras_image_data_format flags indicates whether image preprocessor
-  # output format should be same as the keras backend image data format or just
-  # channel-last format.
-  use_keras_image_data_format = (flags_obj.model == 'mobilenet')
-  train_input_dataset = input_fn(
-      is_training=True,
-      data_dir=flags_obj.data_dir,
-      batch_size=flags_obj.batch_size,
-      parse_record_fn=imagenet_preprocessing.get_parse_record_fn(
-          use_keras_image_data_format=use_keras_image_data_format),
-      datasets_num_private_threads=flags_obj.datasets_num_private_threads,
-      dtype=dtype,
-      drop_remainder=drop_remainder,
-      tf_data_experimental_slack=flags_obj.tf_data_experimental_slack,
-      training_dataset_cache=flags_obj.training_dataset_cache,
-  )
+  checkpoint_manager = tf.train.CheckpointManager(
+      runnable.checkpoint,
+      directory=flags_obj.model_dir,
+      max_to_keep=10,
+      step_counter=runnable.global_step,
+      checkpoint_interval=checkpoint_interval)
 
-  eval_input_dataset = None
-  if not flags_obj.skip_eval:
-    eval_input_dataset = input_fn(
-        is_training=False,
-        data_dir=flags_obj.data_dir,
-        batch_size=flags_obj.batch_size,
-        parse_record_fn=imagenet_preprocessing.get_parse_record_fn(
-            use_keras_image_data_format=use_keras_image_data_format),
-        dtype=dtype,
-        drop_remainder=drop_remainder)
+  resnet_controller = controller.Controller(
+      strategy,
+      runnable.train,
+      runnable.evaluate,
+      global_step=runnable.global_step,
+      steps_per_loop=steps_per_loop,
+      train_steps=per_epoch_steps * train_epochs,
+      checkpoint_manager=checkpoint_manager,
+      summary_interval=summary_interval,
+      eval_steps=eval_steps,
+      eval_interval=eval_interval)
 
-  lr_schedule = common.PiecewiseConstantDecayWithWarmup(
-      batch_size=flags_obj.batch_size,
-      epoch_size=imagenet_preprocessing.NUM_IMAGES['train'],
-      warmup_epochs=common.LR_SCHEDULE[0][1],
-      boundaries=list(p[1] for p in common.LR_SCHEDULE[1:]),
-      multipliers=list(p[0] for p in common.LR_SCHEDULE),
-      compute_lr_on_cpu=True)
-  steps_per_epoch = (
-      imagenet_preprocessing.NUM_IMAGES['train'] // flags_obj.batch_size)
+  time_callback.on_train_begin()
+  resnet_controller.train(evaluate=not flags_obj.skip_eval)
+  time_callback.on_train_end()
 
-  with strategy_scope:
-    if flags_obj.optimizer == 'resnet50_default':
-      optimizer = common.get_optimizer(lr_schedule)
-    elif flags_obj.optimizer == 'mobilenet_default':
-      initial_learning_rate = \
-          flags_obj.initial_learning_rate_per_sample * flags_obj.batch_size
-      optimizer = tf.keras.optimizers.SGD(
-          learning_rate=tf.keras.optimizers.schedules.ExponentialDecay(
-              initial_learning_rate,
-              decay_steps=steps_per_epoch * flags_obj.num_epochs_per_decay,
-              decay_rate=flags_obj.lr_decay_factor,
-              staircase=True),
-          momentum=0.9)
-    if flags_obj.fp16_implementation == 'graph_rewrite':
-      # Note: when flags_obj.fp16_implementation == "graph_rewrite", dtype as
-      # determined by flags_core.get_tf_dtype(flags_obj) would be 'float32'
-      # which will ensure tf.compat.v2.keras.mixed_precision and
-      # tf.train.experimental.enable_mixed_precision_graph_rewrite do not double
-      # up.
-      optimizer = tf.train.experimental.enable_mixed_precision_graph_rewrite(
-          optimizer)
-
-    # TODO(hongkuny): Remove trivial model usage and move it to benchmark.
-    if flags_obj.use_trivial_model:
-      model = trivial_model.trivial_model(
-          imagenet_preprocessing.NUM_CLASSES)
-    elif flags_obj.model == 'resnet50_v1.5':
-      resnet_model.change_keras_layer(flags_obj.use_tf_keras_layers)
-      model = resnet_model.resnet50(
-          num_classes=imagenet_preprocessing.NUM_CLASSES)
-    elif flags_obj.model == 'mobilenet':
-      # TODO(kimjaehong): Remove layers attribute when minimum TF version
-      # support 2.0 layers by default.
-      model = tf.keras.applications.mobilenet.MobileNet(
-          weights=None,
-          classes=imagenet_preprocessing.NUM_CLASSES,
-          layers=tf.keras.layers)
-    if flags_obj.pretrained_filepath:
-      model.load_weights(flags_obj.pretrained_filepath)
-
-    if flags_obj.pruning_method == 'polynomial_decay':
-      if dtype != tf.float32:
-        raise NotImplementedError(
-            'Pruning is currently only supported on dtype=tf.float32.')
-      pruning_params = {
-          'pruning_schedule':
-              tfmot.sparsity.keras.PolynomialDecay(
-                  initial_sparsity=flags_obj.pruning_initial_sparsity,
-                  final_sparsity=flags_obj.pruning_final_sparsity,
-                  begin_step=flags_obj.pruning_begin_step,
-                  end_step=flags_obj.pruning_end_step,
-                  frequency=flags_obj.pruning_frequency),
-      }
-      model = tfmot.sparsity.keras.prune_low_magnitude(model, **pruning_params)
-    elif flags_obj.pruning_method:
-      raise NotImplementedError(
-          'Only polynomial_decay is currently supported.')
-
-    model.compile(
-        loss='sparse_categorical_crossentropy',
-        optimizer=optimizer,
-        metrics=(['sparse_categorical_accuracy']
-                 if flags_obj.report_accuracy_metrics else None),
-        run_eagerly=flags_obj.run_eagerly)
-
-  train_epochs = flags_obj.train_epochs
-
-  callbacks = common.get_callbacks(
-      steps_per_epoch=steps_per_epoch,
-      pruning_method=flags_obj.pruning_method,
-      enable_checkpoint_and_export=flags_obj.enable_checkpoint_and_export,
-      model_dir=flags_obj.model_dir)
-
-  # if mutliple epochs, ignore the train_steps flag.
-  if train_epochs <= 1 and flags_obj.train_steps:
-    steps_per_epoch = min(flags_obj.train_steps, steps_per_epoch)
-    train_epochs = 1
-
-  num_eval_steps = (
-      imagenet_preprocessing.NUM_IMAGES['validation'] // flags_obj.batch_size)
-
-  validation_data = eval_input_dataset
-  if flags_obj.skip_eval:
-    # Only build the training graph. This reduces memory usage introduced by
-    # control flow ops in layers that have different implementations for
-    # training and inference (e.g., batch norm).
-    if flags_obj.set_learning_phase_to_train:
-      # TODO(haoyuzhang): Understand slowdown of setting learning phase when
-      # not using distribution strategy.
-      tf.keras.backend.set_learning_phase(1)
-    num_eval_steps = None
-    validation_data = None
-
-  if not strategy and flags_obj.explicit_gpu_placement:
-    # TODO(b/135607227): Add device scope automatically in Keras training loop
-    # when not using distribition strategy.
-    no_dist_strat_device = tf.device('/device:GPU:0')
-    no_dist_strat_device.__enter__()
-
-  history = model.fit(train_input_dataset,
-                      epochs=train_epochs,
-                      steps_per_epoch=steps_per_epoch,
-                      callbacks=callbacks,
-                      validation_steps=num_eval_steps,
-                      validation_data=validation_data,
-                      validation_freq=flags_obj.epochs_between_evals,
-                      verbose=2)
-
-  eval_output = None
-  if not flags_obj.skip_eval:
-    eval_output = model.evaluate(eval_input_dataset,
-                                 steps=num_eval_steps,
-                                 verbose=2)
-
-  if flags_obj.pruning_method:
-    model = tfmot.sparsity.keras.strip_pruning(model)
-  if flags_obj.enable_checkpoint_and_export:
-    if dtype == tf.bfloat16:
-      logging.warning('Keras model.save does not support bfloat16 dtype.')
-    else:
-      # Keras model.save assumes a float32 input designature.
-      export_path = os.path.join(flags_obj.model_dir, 'saved_model')
-      model.save(export_path, include_optimizer=False)
-
-  if not strategy and flags_obj.explicit_gpu_placement:
-    no_dist_strat_device.__exit__()
-
-  stats = common.build_stats(history, eval_output, callbacks)
+  stats = build_stats(runnable, time_callback)
   return stats
-
-
-def define_imagenet_keras_flags():
-  common.define_keras_flags(
-      model=True,
-      optimizer=True,
-      pretrained_filepath=True)
-  common.define_pruning_flags()
-  flags_core.set_defaults()
-  flags.adopt_module_key_flags(common)
 
 
 def main(_):
@@ -306,5 +188,5 @@ def main(_):
 
 if __name__ == '__main__':
   logging.set_verbosity(logging.INFO)
-  define_imagenet_keras_flags()
+  common.define_keras_flags()
   app.run(main)
